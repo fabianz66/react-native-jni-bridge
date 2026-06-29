@@ -1,97 +1,263 @@
-This is a new [**React Native**](https://reactnative.dev) project, bootstrapped using [`@react-native-community/cli`](https://github.com/react-native-community/cli).
+# ReactNativeJniBridge
 
-# Getting Started
+A React Native 0.86 app (Android) that demonstrates three things working together:
 
-> **Note**: Make sure you have completed the [Set Up Your Environment](https://reactnative.dev/docs/set-up-your-environment) guide before proceeding.
+1. A **home screen** with a URL input and Play button
+2. A **native ExoPlayer** video player rendered as a React Native view component
+3. A **JNI bridge** that calls a C++ function from JavaScript via Kotlin
 
-## Step 1: Start Metro
+---
 
-First, you will need to run **Metro**, the JavaScript build tool for React Native.
+## Architecture Overview
 
-To start the Metro dev server, run the following command from the root of your React Native project:
-
-```sh
-# Using npm
-npm start
-
-# OR using Yarn
-yarn start
+```
+JavaScript (React Native)
+        │
+        ├── Navigation (React Navigation / native-stack)
+        │       ├── HomeScreen     — URL input + Play button
+        │       └── PlayerScreen   — ExoPlayer view + JNI string
+        │
+        ├── VideoPlayer component  — requireNativeComponent('VideoPlayer')
+        │       └── VideoPlayerViewManager.kt  (SimpleViewManager<PlayerView>)
+        │               └── ExoPlayer (Media3)  — plays HLS / HTTP streams
+        │
+        └── NativeModules.JniBridge.getString()
+                └── JniBridgeModule.kt  (ReactContextBaseJavaModule)
+                        └── System.loadLibrary("jnibridge")
+                                └── libjnibridge.so  (C++)
+                                        └── Java_..._nativeGetString()
+                                                └── returns "Hello from C++ via JNI!"
 ```
 
-## Step 2: Build and run your app
+---
 
-With Metro running, open a new terminal window/pane from the root of your React Native project, and use one of the following commands to build and run your Android or iOS app:
+## Project Structure
 
-### Android
+```
+ReactNativeJniBridge/
+├── App.tsx                            # Navigation container + stack definition
+├── src/
+│   ├── screens/
+│   │   ├── HomeScreen.tsx             # URL TextInput + Play button
+│   │   └── PlayerScreen.tsx           # Hosts VideoPlayer view + JNI label
+│   └── components/
+│       └── VideoPlayer.tsx            # requireNativeComponent wrapper
+└── android/
+    └── app/src/main/
+        ├── jni/
+        │   └── CMakeLists.txt         # Master CMake — builds libappmodules.so + libjnibridge.so
+        ├── cpp/
+        │   └── jni_bridge.cpp         # C++ source for libjnibridge.so
+        └── java/com/reactnativejnibridge/
+            ├── MainApplication.kt     # Registers MyPackage
+            ├── MainActivity.kt        # Entry point (unchanged)
+            ├── MyPackage.kt           # ReactPackage that exposes both native pieces
+            ├── JniBridgeModule.kt     # Native module (calls C++ via JNI)
+            └── VideoPlayerViewManager.kt  # ViewManager that wraps ExoPlayer's PlayerView
+```
 
-```sh
-# Using npm
+---
+
+## JavaScript Layer
+
+### `App.tsx` — Navigation root
+
+Sets up a `NativeStackNavigator` with two screens. The dark header style is configured here so it applies globally.
+
+```
+Stack
+ ├── Home   →  HomeScreen
+ └── Player →  PlayerScreen  (receives { url: string } as route param)
+```
+
+### `HomeScreen.tsx`
+
+A controlled `TextInput` (default `http://10.0.0.2/master.m3u8`) and a `TouchableOpacity` that calls `navigation.navigate('Player', { url })`.
+
+### `PlayerScreen.tsx`
+
+Renders two things:
+- `<VideoPlayer style={{ flex: 1 }} url={url} />` — the native ExoPlayer view
+- A bottom panel that calls `NativeModules.JniBridge.getString()` on mount and displays the result
+
+### `src/components/VideoPlayer.tsx`
+
+```ts
+export default requireNativeComponent<{ url: string; style?: ViewStyle }>('VideoPlayer');
+```
+
+`requireNativeComponent` tells React Native to look up a registered `ViewManager` named `"VideoPlayer"` on the native side and treat it as a React component. Props are forwarded to the native view via the bridge.
+
+---
+
+## Android Native Layer
+
+### `MyPackage.kt` — ReactPackage
+
+The entry point for all custom native code. A `ReactPackage` is a container that groups native modules and view managers so React Native can discover them.
+
+```kotlin
+class MyPackage : ReactPackage {
+    override fun createNativeModules(context) = listOf(JniBridgeModule(context))
+    override fun createViewManagers(context) = listOf(VideoPlayerViewManager())
+}
+```
+
+Registered in `MainApplication.kt`:
+```kotlin
+PackageList(this).packages.apply { add(MyPackage()) }
+```
+
+### `VideoPlayerViewManager.kt` — ExoPlayer as a native view
+
+`SimpleViewManager<PlayerView>` is the React Native API for wrapping an Android `View` subclass as a component. The lifecycle is:
+
+| Method | When it runs | What it does |
+|---|---|---|
+| `createViewInstance()` | First render | Creates `ExoPlayer` + `PlayerView`, wires them together |
+| `@ReactProp("url") setUrl()` | Whenever the `url` prop changes | Loads the media item, calls `prepare()` and `playWhenReady = true` |
+| `onDropViewInstance()` | Component unmounts | Calls `player.release()` to free codec and surface resources |
+
+`PlayerView` is from `androidx.media3:media3-ui`. It renders the video surface and playback controls. The underlying decoder is `ExoPlayer` from `androidx.media3:media3-exoplayer`. HLS streams (`.m3u8`) are handled automatically by `androidx.media3:media3-exoplayer-hls` — ExoPlayer detects the format from the URI with no extra configuration.
+
+### `JniBridgeModule.kt` — Native module with JNI
+
+A `ReactContextBaseJavaModule` exposes methods to JavaScript via `@ReactMethod`. This module also loads a native shared library and declares an `external` function (Kotlin's keyword for JNI-implemented functions).
+
+```kotlin
+companion object {
+    init { System.loadLibrary("jnibridge") }  // loads libjnibridge.so at class-load time
+}
+
+private external fun nativeGetString(): String  // body is in C++
+
+@ReactMethod
+fun getString(promise: Promise) {
+    promise.resolve(nativeGetString())
+}
+```
+
+When JS calls `NativeModules.JniBridge.getString()`, it returns a `Promise` that resolves with whatever the C++ function returns.
+
+---
+
+## C++ / JNI Layer
+
+### `cpp/jni_bridge.cpp`
+
+```cpp
+extern "C" JNIEXPORT jstring JNICALL
+Java_com_reactnativejnibridge_JniBridgeModule_nativeGetString(JNIEnv* env, jobject) {
+    return env->NewStringUTF("Hello from C++ via JNI!");
+}
+```
+
+The function name follows the JNI naming convention exactly:
+
+```
+Java_<package_with_underscores>_<ClassName>_<methodName>
+  └─► Java_com_reactnativejnibridge_JniBridgeModule_nativeGetString
+```
+
+When `System.loadLibrary("jnibridge")` runs, the JVM links the `external fun nativeGetString()` declaration in Kotlin to this C symbol at runtime. Calling the Kotlin function dispatches directly into native code.
+
+---
+
+## Build System — The Critical Detail
+
+### Why `src/main/jni/CMakeLists.txt` (not `src/main/cpp/`)?
+
+React Native 0.86 with New Architecture (`newArchEnabled=true`) requires a shared library called **`libappmodules.so`** at startup. This library is the TurboModule registry — the lookup table that maps module names like `"PlatformConstants"` and `"JniBridge"` to their C++ or Java implementations.
+
+`libappmodules.so` is generated by the React Native Gradle Plugin via CMake. The plugin injects three variables into the cmake build:
+
+| Variable | Value |
+|---|---|
+| `REACT_ANDROID_DIR` | `node_modules/react-native/ReactAndroid` |
+| `PROJECT_BUILD_DIR` | Gradle build output directory |
+| `PROJECT_ROOT_DIR` | Root of the Android project |
+
+The plugin expects to control the `externalNativeBuild` cmake path in `build.gradle`. If you add your own standalone `CMakeLists.txt` without including RN's utilities, `libappmodules.so` is never built, and the app crashes on launch with:
+
+```
+Invariant Violation: TurboModuleRegistry.getEnforcing('PlatformConstants') could not be found
+```
+
+The fix is to place `CMakeLists.txt` in `src/main/jni/` and **include RN's cmake utilities first**, so both libraries are built in a single cmake invocation:
+
+```cmake
+# android/app/src/main/jni/CMakeLists.txt
+
+cmake_minimum_required(VERSION 3.22.1)
+project("appmodules")   # ← must match — SoLoader looks for libappmodules.so
+
+# Builds libappmodules.so using RN's default OnLoad.cpp + autolinking generated files.
+# REACT_ANDROID_DIR, PROJECT_BUILD_DIR, PROJECT_ROOT_DIR are injected by the Gradle plugin.
+include("${REACT_ANDROID_DIR}/cmake-utils/ReactNative-application.cmake")
+
+# Our library is added alongside without interfering with libappmodules.so.
+add_library(jnibridge SHARED ${CMAKE_CURRENT_SOURCE_DIR}/../cpp/jni_bridge.cpp)
+find_library(log-lib log)
+target_link_libraries(jnibridge ${log-lib})
+```
+
+`ReactNative-application.cmake` uses those injected variables to:
+- Compile `default-app-setup/OnLoad.cpp` (the default TurboModule provider entry point)
+- Pull in the autolinking-generated `.cpp` files for third-party native libraries
+- Link against `fbjni`, `jsi`, and `reactnative` prefab targets from the Maven AAR
+
+The result is two `.so` files in the APK per ABI:
+
+| Library | Purpose |
+|---|---|
+| `libappmodules.so` | RN TurboModule registry — required for the JS runtime |
+| `libjnibridge.so` | Our custom C++ code |
+
+### `app/build.gradle` additions
+
+```gradle
+defaultConfig {
+    externalNativeBuild {
+        cmake { cppFlags "-std=c++17" }
+    }
+}
+externalNativeBuild {
+    cmake {
+        path "src/main/jni/CMakeLists.txt"
+        version "3.22.1"
+    }
+}
+
+// Permit cleartext HTTP in debug builds (needed for http:// stream URLs)
+buildTypes {
+    debug {
+        manifestPlaceholders = [usesCleartextTraffic: true]
+    }
+}
+
+dependencies {
+    implementation("androidx.media3:media3-exoplayer:1.5.0")
+    implementation("androidx.media3:media3-exoplayer-hls:1.5.0")
+    implementation("androidx.media3:media3-ui:1.5.0")
+}
+```
+
+---
+
+## New Architecture Interop
+
+This app runs in **New Architecture mode** (`newArchEnabled=true` in `gradle.properties`), which uses the Fabric renderer and TurboModule system. The custom native code here uses the **legacy APIs** (`SimpleViewManager`, `ReactContextBaseJavaModule`, `ReactPackage`) — this works because React Native 0.86 ships an interop layer that wraps legacy modules automatically. No codegen spec files are required.
+
+---
+
+## Running
+
+```bash
 npm run android
-
-# OR using Yarn
-yarn android
 ```
 
-### iOS
-
-For iOS, remember to install CocoaPods dependencies (this only needs to be run on first clone or after updating native deps).
-
-The first time you create a new project, run the Ruby bundler to install CocoaPods itself:
-
-```sh
-bundle install
-```
-
-Then, and every time you update your native dependencies, run:
-
-```sh
-bundle exec pod install
-```
-
-For more information, please visit [CocoaPods Getting Started guide](https://guides.cocoapods.org/using/getting-started.html).
-
-```sh
-# Using npm
-npm run ios
-
-# OR using Yarn
-yarn ios
-```
-
-If everything is set up correctly, you should see your new app running in the Android Emulator, iOS Simulator, or your connected device.
-
-This is one way to run your app — you can also build it directly from Android Studio or Xcode.
-
-## Step 3: Modify your app
-
-Now that you have successfully run the app, let's make changes!
-
-Open `App.tsx` in your text editor of choice and make some changes. When you save, your app will automatically update and reflect these changes — this is powered by [Fast Refresh](https://reactnative.dev/docs/fast-refresh).
-
-When you want to forcefully reload, for example to reset the state of your app, you can perform a full reload:
-
-- **Android**: Press the <kbd>R</kbd> key twice or select **"Reload"** from the **Dev Menu**, accessed via <kbd>Ctrl</kbd> + <kbd>M</kbd> (Windows/Linux) or <kbd>Cmd ⌘</kbd> + <kbd>M</kbd> (macOS).
-- **iOS**: Press <kbd>R</kbd> in iOS Simulator.
-
-## Congratulations! :tada:
-
-You've successfully run and modified your React Native App. :partying_face:
-
-### Now what?
-
-- If you want to add this new React Native code to an existing application, check out the [Integration guide](https://reactnative.dev/docs/integration-with-existing-apps).
-- If you're curious to learn more about React Native, check out the [docs](https://reactnative.dev/docs/getting-started).
-
-# Troubleshooting
-
-If you're having issues getting the above steps to work, see the [Troubleshooting](https://reactnative.dev/docs/troubleshooting) page.
-
-# Learn More
-
-To learn more about React Native, take a look at the following resources:
-
-- [React Native Website](https://reactnative.dev) - learn more about React Native.
-- [Getting Started](https://reactnative.dev/docs/environment-setup) - an **overview** of React Native and how setup your environment.
-- [Learn the Basics](https://reactnative.dev/docs/getting-started) - a **guided tour** of the React Native **basics**.
-- [Blog](https://reactnative.dev/blog) - read the latest official React Native **Blog** posts.
-- [`@facebook/react-native`](https://github.com/facebook/react-native) - the Open Source; GitHub **repository** for React Native.
+**Requirements:**
+- Node ≥ 22
+- Java 17 — `export JAVA_HOME=/opt/homebrew/opt/openjdk@17`
+- Android SDK — `export ANDROID_HOME=$HOME/Library/Android/sdk`
+- A running emulator or connected device

@@ -291,7 +291,46 @@ When JS calls `NativeModules.JniBridge.getString()`, the call goes through **JSI
 
 ---
 
-### Channel 2 — View Managers (VideoPlayer)
+### Channel 2 — Native-to-JS Events (Player State)
+
+This handles the native side pushing unsolicited updates to JS — the reverse direction.
+
+```
+ExoPlayer                   Kotlin (UI thread)           JS (React thread)
+─────────                   ──────────────────           ─────────────────
+Player.Listener
+ onPlaybackStateChanged()
+ onIsPlayingChanged()
+ onPlayerError()
+     │
+     ▼
+ resolveState(player)       ──► "buffering" / "playing" / "paused" / "ended" / "error"
+                                     │
+                                     ▼
+                            DeviceEventManagerModule
+                             .RCTDeviceEventEmitter
+                             .emit("onPlayerStateChanged", { state, error? })
+                                     │
+                                     │  through JSI event queue
+                                     ▼
+                                            DeviceEventEmitter
+                                             .addListener(
+                                               'onPlayerStateChanged',
+                                               e => setPlayerState(e.state)
+                                             )
+```
+
+**How it works:**
+- `VideoPlayerViewManager` attaches a `Player.Listener` to the ExoPlayer instance inside `createViewInstance`. The listener fires on the Android UI thread whenever ExoPlayer transitions between states.
+- To decide the label, `resolveState()` reads both `player.playbackState` (IDLE / BUFFERING / READY / ENDED) and `player.isPlaying` (true only when frames are actually being rendered), collapsing them into one of: `idle`, `buffering`, `playing`, `paused`, `ended`, or `error`.
+- The Kotlin side emits via `context.getJSModule(DeviceEventManagerModule.RCTDeviceEventEmitter::class.java).emit(...)`. This call is thread-safe — RN schedules the delivery onto the JS thread automatically.
+- The JS side subscribes with `DeviceEventEmitter.addListener('onPlayerStateChanged', callback)` inside a `useEffect` and removes the subscription on unmount to avoid stale listeners after navigation.
+
+This pattern — **native emits, JS subscribes** — is the standard mechanism for any push-style event: playback state, sensor readings, push notifications, bluetooth events, etc.
+
+---
+
+### Channel 3 — View Managers (VideoPlayer)
 
 This handles JS rendering a native Android view and sending props to it.
 

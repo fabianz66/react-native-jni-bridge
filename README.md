@@ -244,6 +244,138 @@ dependencies {
 
 ---
 
+## JS ↔ Android Bridge — How They Communicate
+
+There are two separate communication channels in this app, one for **method calls** (`JniBridge`) and one for **UI/views** (`VideoPlayer`). They work differently.
+
+### Channel 1 — Native Modules (JniBridge)
+
+This handles JS calling Kotlin functions and getting results back.
+
+```
+JS                          C++ (JSI layer)              Kotlin/Java
+──                          ───────────────              ───────────
+NativeModules
+ .JniBridge
+ .getString()
+     │
+     ▼
+TurboModuleRegistry
+ .getEnforcing('JniBridge')
+     │
+     │  looks up in libappmodules.so
+     │  finds JniBridgeModule
+     ▼
+ calls getString(promise)   ──────────────────────────►  JniBridgeModule.kt
+                                                              │
+                                                              ▼
+                                                         nativeGetString()
+                                                              │  (JNI call)
+                                                              ▼
+                                                         jni_bridge.cpp
+                                                              │
+                                                         "Hello from C++ via JNI!"
+                                                              │
+                                                    ◄─────────┘
+                             promise.resolve(string)
+     │
+     ▼
+ .then(s => setJniString(s))
+```
+
+**What actually moves across the boundary:**
+
+When JS calls `NativeModules.JniBridge.getString()`, the call goes through **JSI (JavaScript Interface)** — a C++ layer that gives the JS engine a direct handle to native objects. In New Architecture, native modules are exposed as C++ host objects that JS can call directly without serialization to JSON. The return value (`promise.resolve(string)`) marshals a `jstring` from JNI → a Java `String` → a JSI `jsi::String` back into the JS heap.
+
+**Threading:** `@ReactMethod` runs on the **native modules thread** (a background thread), not the JS thread and not the UI thread. That is why the result is returned via a `Promise` rather than synchronously — the JS thread never blocks.
+
+---
+
+### Channel 2 — View Managers (VideoPlayer)
+
+This handles JS rendering a native Android view and sending props to it.
+
+```
+JS                          Fabric (C++ renderer)        Kotlin/Java
+──                          ─────────────────────        ───────────
+<VideoPlayer
+  url="http://..."
+  style={{ flex:1 }}
+/>
+  │
+  ▼
+React reconciler
+  │  creates a shadow node
+  ▼
+Fabric C++ layout engine
+  │  measures + positions the view
+  │
+  │  calls into ViewManager registry
+  │  looks up "VideoPlayer"
+  ▼
+VideoPlayerViewManager.kt
+  │
+  ├── createViewInstance()    ←── called once on first render
+  │       creates ExoPlayer
+  │       creates PlayerView
+  │       wires them together
+  │
+  └── setUrl(view, url)       ←── called when `url` prop changes
+          player.setMediaItem(...)
+          player.prepare()
+          player.playWhenReady = true
+```
+
+**What actually moves across the boundary:**
+
+Props (like `url`) are diffed by the React reconciler. Only changed props are sent. They are passed as typed values through Fabric's C++ layer into `@ReactProp`-annotated Kotlin methods. There is no JSON serialization — Fabric passes values directly as C++ primitives that map to JNI types.
+
+The **view itself** (the `PlayerView` / `SurfaceView` that ExoPlayer draws to) lives entirely in Android's view hierarchy — it never crosses the bridge. JS only knows about it as a virtual node in React's shadow tree. Fabric reconciles the shadow tree with the real Android view tree on the **UI thread**.
+
+---
+
+### Old Architecture vs New Architecture
+
+This project uses `newArchEnabled=true`, which matters:
+
+| | Old Architecture (Bridge) | New Architecture (JSI + Fabric) |
+|---|---|---|
+| Transport | JSON serialized over an async message queue | Direct C++ function calls via JSI |
+| Modules | Lazy-loaded, reflected via Java annotations | C++ host objects, registered in `libappmodules.so` |
+| Views | `UIManager` dispatches commands via the bridge | Fabric C++ renderer, synchronous layout |
+| Threading | Always async, always a round-trip | Can be synchronous, no serialization overhead |
+| Our modules | Would use `NativeModules` global directly | Go through TurboModule interop layer |
+
+Because we used `SimpleViewManager` and `ReactContextBaseJavaModule` (legacy APIs), React Native wraps them in an **interop adapter** automatically. From JS's perspective the call looks identical — but under the hood, instead of going through the old JSON queue, it goes through the TurboModule/Fabric C++ layer.
+
+---
+
+### The `libappmodules.so` Role at Startup
+
+This is the piece that ties it all together:
+
+```
+App launch
+    │
+    ├── loadReactNative(this)         ← loads libreactnative.so, libhermes.so
+    │
+    ├── SoLoader loads libappmodules.so
+    │       │
+    │       └── OnLoad.cpp (default-app-setup)
+    │               registers TurboModule providers
+    │               registers Fabric component descriptors
+    │               wires up autolinking (react-native-screens, safe-area-context, etc.)
+    │
+    └── JS bundle starts executing
+            TurboModuleRegistry.getEnforcing('PlatformConstants') ✓
+            TurboModuleRegistry.getEnforcing('JniBridge')         ✓  ← our module
+            requireNativeComponent('VideoPlayer')                 ✓  ← our view
+```
+
+`libappmodules.so` is what the JS runtime queries when it needs any native module or native component. If it is missing (which happened when we had the wrong CMake setup), every native lookup fails — including `PlatformConstants`, which React Native needs before it can render a single component.
+
+---
+
 ## New Architecture Interop
 
 This app runs in **New Architecture mode** (`newArchEnabled=true` in `gradle.properties`), which uses the Fabric renderer and TurboModule system. The custom native code here uses the **legacy APIs** (`SimpleViewManager`, `ReactContextBaseJavaModule`, `ReactPackage`) — this works because React Native 0.86 ships an interop layer that wraps legacy modules automatically. No codegen spec files are required.
